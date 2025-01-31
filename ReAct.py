@@ -1,20 +1,20 @@
 
 import json
-from typing import Dict, Any
+from typing import  List, Dict, Optional, Union, Any
 import copy
 from typing import List, Callable, Union
 from jsonschema import validate, ValidationError
 import inspect
 from repl.tools import web_search, get_weather, date,  ask_user, write_code, find_symbol, read_url
-from repl.prompts import ACTION_SCHEMA, REFLECTION_SCHEMA, SYSTEM_PROMPTS
-from repl.util import process_and_print_streaming_response, function_to_json
-from repl.types import Result, Agent
+from repl.prompts import ACTION_SCHEMA, REFLECTION_SCHEMA, SYSTEM_PROMPTS, PLANNER_SCHEMA, REQUIREMENTS_SCHEMA , STEP_CONFIG
+from repl.util import process_and_print_streaming_response, function_to_string
 from datetime import datetime
-from openai import OpenAI, BadRequestError, RateLimitError, AuthenticationError, Timeout, APIConnectionError
-import httpx
+from openai import OpenAI
+from repl.types import Result, Agent
 import logging
-import requests
 from requests.exceptions import RequestException, Timeout, ConnectionError
+from repl.llm import LLM
+
 
 logging.basicConfig(
     filename="app.log",  # Log file name
@@ -23,70 +23,70 @@ logging.basicConfig(
     level=logging.INFO   # Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
 )
 
-client = OpenAI(base_url='http://localhost:11434/v1/', api_key='ollama', timeout=20.0)
-
 __CTX_VARS_NAME__ = "context_variables"
-       
+
+class Requirements:
+    def __init__(self, **kwargs):
+        self.requirements = kwargs
+
+    def add_requirement(self, item):
+        self.requirements.append(item)       
+
 class ReAct:
-    def __init__(self, model="phi4:14b", context ="", temperature=0.1, top_p=0.5):             
-        self.steps = ["think", "action", "observation", "reflection"]
-        self.output_format = []   
-        self.context: str = "",    
+    def __init__(self, llm=LLM(), context="" , step_config=STEP_CONFIG):
+        """
+        Initializes the ReAct agent with configurable steps, system prompts, and response schemas.
+
+        Args:
+            model (str): The LLM model to use.
+            context (str): Additional context for the agent.
+            temperature (float): Sampling temperature for responses.
+            top_p (float): Nucleus sampling parameter.
+            step_config (dict): Dictionary defining steps, each with a system prompt and schema.
+        """
+        self.steps = list(step_config.keys()) if step_config else ["think", "action", "observation", "reflection"]
+        self.step_config = step_config or {}
+        self.context = context    
         self.function_map = None  
-        self.model = model
-        self.temperature = temperature
-        self.max_completion_tokens = 2000
-        self.top_p = top_p
-        
-    def get_chat_completion(self, messages, functions=None, stream=False, response_format=None):
-        tools = [function_to_json(f) for f in functions] if functions else []
+        self.llm = llm
 
-        messages = [
-        msg for msg in messages
-        if isinstance(msg, dict) and 
-           "role" in msg and "content" in msg and 
-           isinstance(msg["content"], str) and msg["content"].strip()
-        ]
-        
-        create_params = {
-            "model": self.model,
-            "temperature": self.temperature,
-            "messages": messages,  
-            "max_tokens": self.max_completion_tokens,           
-            "top_p": self.top_p,                   
-            "stream": stream,                
-        }  
-
-        if response_format:
-            create_params["response_format"] = response_format     
-
-        if tools:
-            create_params['tools'] = tools  
-
-                    
-        return client.chat.completions.create(**create_params)                
-            
-    
     def format_response(self, content: str, step: str) -> Dict[str, Any]:
-        if step == "action":
+        """
+        Formats the response based on the step and its corresponding schema.
+        
+        Args:
+            content (str): The raw response content from the model.
+            step (str): The current step (e.g., "action", "reflection").
+
+        Returns:
+            Dict[str, Any]: A formatted response, including parsed JSON if applicable.
+        """
+        if step not in self.step_config:
+            return {"error": f"Unknown step: {step}", "text": content.strip()}
+
+        # Get schema for the step (if any)
+        schema = self.step_config[step].get("schema")
+
+        if schema:
             try:
+                # Parse and validate JSON response
                 data = json.loads(content)
-                validate(instance=data, schema=ACTION_SCHEMA)
+                validate(instance=data, schema=schema)
                 return data
-            except (json.JSONDecodeError, ValidationError) as e:
-                return {"error": f"Invalid action format: {str(e)}"}
+            except json.JSONDecodeError:
+                return {"error": f"Invalid JSON format for step: {step}", "raw_content": content}
+            except ValidationError as e:
+                return {"error": f"Schema validation failed for step: {step}", "details": str(e)}
 
-        elif step == "reflection":
-            try:
-                data = json.loads(content)
-                validate(instance=data, schema=REFLECTION_SCHEMA)
-                return data
-            except (json.JSONDecodeError, ValidationError) as e:
-                return {"error": f"Invalid reflection format: {str(e)}"}
+        # If no schema is provided, return plain text
+        return {"text": content.strip()}   
 
-        # For think/observation, just return text
-        return {"text": content.strip()} 
+    def get_step_prompt_and_schema(self, step):
+        """Fetches the system prompt and schema for a given step."""
+        config = self.step_config.get(step, {})
+        return config.get("prompt", ""), config.get("schema", None)
 
+    
     def handle_tool_calls(self, action: Dict[str, Any]):
         """
         Executes an action by looking up the corresponding function in the function map.
@@ -136,112 +136,6 @@ class ReAct:
                 except Exception as e:
                     error_message = f"Failed to cast response to string: {result}. Make sure agent functions return a string or Result object. Error: {str(e)}"                    
                     raise TypeError(error_message)
-    
-    
-    def run(self,
-        input:str,    
-        messages: List, #history        
-        tools: List = [],
-        max_turns: int = 20,          
-        debug: bool = True):
-    
-        current_step_idx = 0
-        finished  = False
-
-        # Create a mapping of function names to functions
-        self.function_map = {f.__name__: f for f in tools} 
-        
-        input_message = [{"role": "user", "content": input}]
-        
-        history = copy.deepcopy(messages)
-        init_len = len(messages)  
-
-        functions = [function_to_json(f) for f in tools]    
-        memory=[]
-        while not finished and len(memory)  < max_turns:
-        
-            current_step = self.steps[current_step_idx]   
-            
-            system_prompt = SYSTEM_PROMPTS[current_step].format(context = self.context , tools=functions, date=datetime.now())      
-            
-            if memory:
-                messages = [{"role": "system", "content": system_prompt}] + input_message + memory[-4:]
-            else:
-                messages = [{"role": "system", "content": system_prompt}] + history[-4:] + input_message 
-            
-            if current_step in ["action", "reflection"]:
-                response_format = {"type": "json_object","json_schema": ACTION_SCHEMA if current_step == "action" else REFLECTION_SCHEMA} 
-            else:
-                response_format = None
-        
-            # Get completion from your preferred LLM API
-            try:
-                completion = self.get_chat_completion(messages, stream=True, response_format=response_format)
-            
-            except Exception as e:                
-                if hasattr(e, 'message'):                    
-                    yield {"error": e.message, "step": "chat"} 
-
-                yield {"response": [] } # Yield only the new messages added to the history
-                return
-            
-            message_content=''
-
-            for chunk in completion:
-                delta = chunk.choices[0].delta
-                
-                if delta.content:                     
-                    yield {"content": delta.content, "step": current_step}                    
-                    message_content += delta.content              
-            
-            memory.append({"role": "assistant", "content": message_content, "step": current_step}) 
-            # Process the response
-            response = self.format_response(message_content, current_step)
-
-            match current_step:
-                case "reflection":
-                    if response.get("done", False):
-                        finished = True
-                        continue 
-                case "action":                    
-                    try:
-                        result = self.handle_tool_calls(response)
-                        tool_result = self.handle_function_result(result)                       
-                        
-                        memory.append({
-                            "role": "tool",
-                            "content": tool_result.value,
-                            "step": current_step
-                        })                        
-                        
-                        if tool_result.repeat:
-                            yield {"content": "No Tool Result.Try again.", "step": "tool"}
-                            continue  # Repeat the action step                        
-
-                        if tool_result.finish:
-                            finished = True
-                            yield {"content": tool_result.value, "step": "observation"}
-                            memory.append({
-                                "role": "assistant",
-                                "content": tool_result.value,
-                                "step": "observation"
-                            })
-                            continue                             
-                        
-                        yield {"content":  tool_result.value, "step": "tool"}
-
-                    except Exception as e:   
-                        memory.append({"role": "tool", "content": e.message})
-                        continue     
-
-            current_step_idx = (current_step_idx + 1) % len(self.steps) 
-        
-        if len(memory) - init_len >= max_turns:
-            memory.append({"role": "assistant", "content": "Can't find a solution, try again.", "step": "MaxTurns"}) 
-            yield {"content":  "Can't find a solution, try again.", "step": "observation"} 
-        
-        yield {"response": input_message + self.summarize_history(memory[init_len:]) } # Yield only the new messages added to the history    
-
 
     def summarize_history(self, history):
         """
@@ -258,16 +152,99 @@ class ReAct:
         )
         return [last_observation]
 
+    def execute(self, input_str, messages, tools=[], max_turns=20, debug=True):
+        current_step_idx = 0
+        finished = False
+
+        # Create a function map for available tools
+        self.function_map = {f.__name__: f for f in tools} 
+        
+        input_message = [{"role": "user", "content": input_str}]
+        history = copy.deepcopy(messages)
+        memory = []
+        
+        while not finished and len(memory) < max_turns:
+            current_step = self.steps[current_step_idx]
+            system_prompt, response_schema = self.get_step_prompt_and_schema(current_step)
+            
+            # Format the system prompt   
+            if "{tools}" in system_prompt: 
+                functions = [function_to_string(f) for f in tools]   
+                system_prompt = system_prompt.format( tools=functions)  
+
+            response_format = {"type": "json_object", "json_schema": response_schema} if response_schema else None
+
+            # Construct messages
+            messages = [{"role": "system", "content": system_prompt}] + history + input_message + memory
+
+            try:
+                completion = self.llm.get_chat_completion(messages, stream=True, response_format=response_format)
+            except Exception as e:
+                yield {"error": str(e), "step": "chat"}
+                return
+            
+            message_content = ""
+            for chunk in completion:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield {"content": delta.content, "step": current_step}
+                    message_content += delta.content
+
+            memory.append({"role": "assistant", "content": message_content, "step": current_step})
+
+            # Process the response
+            response = self.format_response(message_content, current_step)
+
+            match current_step:
+                case "reflection":
+                    if response.get("done", False):
+                        finished = True
+                        continue
+                case "action":
+                    try:
+                        result = self.handle_tool_calls(response)
+                        tool_result = self.handle_function_result(result)
+                        
+                        memory.append({
+                            "role": "tool",
+                            "content": tool_result.value,
+                            "step": current_step
+                        })
+                        
+                        if tool_result.repeat:
+                            yield {"content": "No Tool Result. Try again.", "step": "tool"}
+                            continue
+
+                        if tool_result.finish:
+                            finished = True
+                            yield {"content": tool_result.value, "step": "observation"}
+                            memory.append({
+                                "role": "assistant",
+                                "content": tool_result.value,
+                                "step": "observation"
+                            })
+                            continue
+
+                        yield {"content": tool_result.value, "step": "tool"}
+
+                    except Exception as e:
+                        memory.append({"role": "tool", "content": str(e)})
+                        continue
+
+            current_step_idx = (current_step_idx + 1) % len(self.steps)
+
+        yield {"response": input_message + self.summarize_history(memory)}
 
 
 def run_react_loop(store_history=False):
-    agent = ReAct(model="phi4:14b") 
+    agent = ReAct(context="AI assistant for engineering tasks") 
     history = []    
     
     while True:
         print()  # Adds an empty line
-        user_input = input("\033[91mUser\033[0m: ")        
-        response =  agent.run(user_input, history, tools=[web_search, read_url, ask_user])  
+        user_input = input("\033[91mUser\033[0m: ")     
+         
+        response =  agent.execute(user_input , history, tools=[ web_search, write_code, ask_user])  
         response = process_and_print_streaming_response(response)   
         
         if store_history:

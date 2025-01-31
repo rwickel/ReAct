@@ -76,6 +76,38 @@ def function_to_json(func) -> dict:
         },
     }
 
+def function_to_string(func) -> str:
+    """
+    Converts a Python function into a string representation
+    that includes the function name, parameters, and description.
+
+    Args:
+        func: The function to be converted.
+
+    Returns:
+        A string describing the function and its parameters.
+    """
+    try:
+        signature = inspect.signature(func)
+    except ValueError as e:
+        return f"Error retrieving signature for {func.__name__}: {str(e)}"
+    
+    # Extract function name
+    func_name = func.__name__
+
+    # Extract function parameters
+    params = []
+    for param in signature.parameters.values():
+        param_name = param.name
+        param_type = param.annotation.__name__ if param.annotation != inspect.Parameter.empty else "any"
+        params.append(f"{param_name}: {param_type}")
+
+    # Extract docstring (first line only)
+    description = (func.__doc__ or "No description available").strip().split("\n")[0]
+
+    # Create function signature string
+    param_str = ", ".join(params)
+    return f"{func_name}({param_str}) - {description}\n"
 
 def process_and_print_streaming_response(response):
     content = ""
