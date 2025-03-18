@@ -1,4 +1,4 @@
-# Agentif Framework with ReAct Agent with OpenAI Integration
+# Agentic Framework with ReAct Agent with OpenAI Integration
 
 This project implements a ReAct (Reasoning and Acting) agent that interacts with an OpenAI-compatible API to perform tasks using a set of predefined tools. The agent follows a cycle of thinking, acting, observing, and reflecting to solve problems or answer questions.
 
